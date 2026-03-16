@@ -54,6 +54,7 @@ from torch.testing._internal.common_cuda import (
     PLATFORM_SUPPORTS_FUSED_ATTENTION,
     PLATFORM_SUPPORTS_CUDNN_ATTENTION,
     PLATFORM_SUPPORTS_CK_SDPA,
+    tf32_off,
     tf32_on_and_off,
     tf32_enabled,
 )
@@ -261,6 +262,10 @@ def rand_sdpa_tensor(shape: SdpaShape, device: str, dtype: torch.dtype, type: st
         size = (batch, seq_len, num_heads, head_dim) if not packed else (batch, seq_len, 3 * num_heads * head_dim)
         return torch.randn(size, device=device, dtype=dtype, requires_grad=requires_grad)
 
+def compute_golden_reference_ieee(func, *args, **kwargs):
+    """Wrapper to compute golden reference with IEEE precision."""
+    with tf32_off():
+        return func(*args, **kwargs)
 
 class TestTransformers(NNTestCase):
     _do_cuda_memory_leak_check = True
@@ -3950,8 +3955,9 @@ class TestSDPACudaOnly(NNTestCase):
         if dropout_p == 0.0:
             with sdpa_kernel(backends=[SDPBackend.MATH]):
                 # High Precision Math Reference
-                out_ref = F.scaled_dot_product_attention(query_ref, key_ref, value_ref,
-                                                         dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+                out_ref = compute_golden_reference_ieee(
+                    F.scaled_dot_product_attention, query_ref, key_ref, value_ref,
+                    dropout_p=dropout_p, is_causal=is_causal, scale=scale)
                 # Low Precision Math Reference
                 out_lp_ref = F.scaled_dot_product_attention(query, key, value,
                                                             dropout_p=dropout_p, is_causal=is_causal, scale=scale)
@@ -3962,8 +3968,10 @@ class TestSDPACudaOnly(NNTestCase):
             torch.manual_seed(seed)
             dropout_mask = _get_mem_eff_drop_mask(batch_size, n_heads, seq_len_q, seq_len_k, dropout_p, seed, 0, device=device)
             # High Precision Math Reference
-            out_ref = torch.ops.aten._scaled_dot_product_attention_math(
-                query_ref, key_ref, value_ref, dropout_p=dropout_p, is_causal=is_causal, scale=scale, dropout_mask=dropout_mask)[0]
+            out_ref = compute_golden_reference_ieee(
+                torch.ops.aten._scaled_dot_product_attention_math,
+                query_ref, key_ref, value_ref, dropout_p=dropout_p, is_causal=is_causal, scale=scale,
+                dropout_mask=dropout_mask)[0]
             # Low Precision Math Reference
             out_lp_ref = torch.ops.aten._scaled_dot_product_attention_math(
                 query, key, value, dropout_p=dropout_p, is_causal=is_causal, scale=scale,
@@ -3973,7 +3981,8 @@ class TestSDPACudaOnly(NNTestCase):
 
         grads = torch.autograd.grad(out, (query, key, value), upstream_grad)
         grads_ref_lp = torch.autograd.grad(out_lp_ref, (query, key, value), upstream_grad)
-        grads_ref = torch.autograd.grad(out_ref, (query_ref, key_ref, value_ref), upstream_grad)
+        grads_ref = compute_golden_reference_ieee(
+            torch.autograd.grad, out_ref, (query_ref, key_ref, value_ref), upstream_grad)
 
         fudge_factors = {
             'out': 3.0 ,
@@ -4070,8 +4079,9 @@ class TestSDPACudaOnly(NNTestCase):
         if dropout_p == 0.0:
             with sdpa_kernel(backends=[SDPBackend.MATH]):
                 # High Precision Math Reference
-                out_ref = F.scaled_dot_product_attention(query_ref, key_ref, value_ref, attn_mask_ref,
-                                                         dropout_p=dropout_p, is_causal=is_causal, scale=scale)
+                out_ref = compute_golden_reference_ieee(
+                    F.scaled_dot_product_attention, query_ref, key_ref, value_ref, attn_mask_ref,
+                    dropout_p=dropout_p, is_causal=is_causal, scale=scale)
                 # Low Precision Math Reference
                 out_lp_ref = F.scaled_dot_product_attention(query, key, value, attn_mask,
                                                             dropout_p=dropout_p, is_causal=is_causal, scale=scale)
@@ -4083,7 +4093,8 @@ class TestSDPACudaOnly(NNTestCase):
             dropout_mask = _get_mem_eff_drop_mask(batch_size, n_heads, seq_len_q,
                                                   seq_len_k, dropout_p, seed, 0, device=device)
             # High Precision Math Reference
-            out_ref = torch.ops.aten._scaled_dot_product_attention_math(
+            out_ref = compute_golden_reference_ieee(
+                torch.ops.aten._scaled_dot_product_attention_math,
                 query_ref, key_ref, value_ref, attn_mask_ref, dropout_p=dropout_p, is_causal=is_causal,
                 scale=scale, dropout_mask=dropout_mask)[0]
             # Low Precision Math Reference
@@ -4096,7 +4107,8 @@ class TestSDPACudaOnly(NNTestCase):
 
         grads = torch.autograd.grad(out, (query, key, value, attn_mask), upstream_grad)
         grads_ref_lp = torch.autograd.grad(out_lp_ref, (query, key, value, attn_mask), upstream_grad)
-        grads_ref = torch.autograd.grad(out_ref, (query_ref, key_ref, value_ref, attn_mask_ref), upstream_grad)
+        grads_ref = compute_golden_reference_ieee(
+            torch.autograd.grad, out_ref, (query_ref, key_ref, value_ref, attn_mask_ref), upstream_grad)
 
         fudge_factors = {
             "out": 4,
@@ -4180,7 +4192,7 @@ class TestSDPACudaOnly(NNTestCase):
         value = torch.rand(batch_size, num_heads_kv, seq_len_k, head_dim,
                            device=device, dtype=dtype, requires_grad=True)
 
-        higher_precision_dtype = torch.float64
+        higher_precision_dtype = torch.float64 if dtype == torch.float32 else torch.float32
         query_ref, key_ref, value_ref = query_key_value_clones(query, key, value, dtype=higher_precision_dtype)
 
         is_dropout = dropout_p > 0.0
@@ -4191,7 +4203,8 @@ class TestSDPACudaOnly(NNTestCase):
                     query, key, value, dropout_p=dropout_p, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
             with sdpa_kernel(backends=[SDPBackend.MATH]):
                 # High Precision Math Reference
-                out_ref = F.scaled_dot_product_attention(
+                out_ref = compute_golden_reference_ieee(
+                    F.scaled_dot_product_attention,
                     query_ref, key_ref, value_ref, is_causal=is_causal, scale=scale, enable_gqa=enable_gqa)
                 # Low Precision Math Reference
                 out_lp_ref = F.scaled_dot_product_attention(
@@ -4230,7 +4243,8 @@ class TestSDPACudaOnly(NNTestCase):
                 dropout_mask = (softmax_mask <= int((1.0 - dropout_p) * 255.0)).to(torch.float32)
 
             # High Precision Math Reference
-            out_ref = torch.ops.aten._scaled_dot_product_attention_math(
+            out_ref = compute_golden_reference_ieee(
+                torch.ops.aten._scaled_dot_product_attention_math,
                 query_ref, key_ref, value_ref, dropout_p=dropout_p, is_causal=is_causal,
                 scale=scale, dropout_mask=dropout_mask, enable_gqa=enable_gqa)[0]
             # Low Precision Math Reference
@@ -4247,7 +4261,7 @@ class TestSDPACudaOnly(NNTestCase):
 
         grads = torch.autograd.grad(out, (query, key, value), upstream_grad)
         grads_ref_lp = torch.autograd.grad(out_lp_ref, (query, key, value), upstream_grad)
-        grads_ref = torch.autograd.grad(out_ref, (query_ref, key_ref, value_ref), upstream_grad)
+        grads_ref = compute_golden_reference_ieee(torch.autograd.grad, out_ref, (query_ref, key_ref, value_ref), upstream_grad)
 
         fudge_factors = {
             'out': 4,
@@ -4410,8 +4424,9 @@ class TestSDPACudaOnly(NNTestCase):
         with sdpa_kernel(backends=[SDPBackend.MATH]):
             if dropout_p == 0.0:
                 # High Precision Math Reference
-                out_ref = F.scaled_dot_product_attention(query_ref, key_ref, value_ref,
-                                                         dropout_p=dropout_p, is_causal=is_causal)
+                out_ref = compute_golden_reference_ieee(
+                    F.scaled_dot_product_attention, query_ref, key_ref, value_ref,
+                    dropout_p=dropout_p, is_causal=is_causal)
                 # Low Precision Math Reference
                 out_lp_ref = F.scaled_dot_product_attention(query, key, value,
                                                             dropout_p=dropout_p, is_causal=is_causal)
@@ -4421,7 +4436,8 @@ class TestSDPACudaOnly(NNTestCase):
                 dropout_mask = get_dropout_mask(output_tuple, fused_kernel, batch_size,
                                                 n_heads, seq_len_q, seq_len_k, dropout_p, device)
                 # High Precision Math Reference
-                out_ref = torch.ops.aten._scaled_dot_product_attention_math(
+                out_ref = compute_golden_reference_ieee(
+                    torch.ops.aten._scaled_dot_product_attention_math,
                     query_ref, key_ref, value_ref, dropout_p=dropout_p, is_causal=is_causal,
                     dropout_mask=dropout_mask)[0]
                 # Low Precision Math Reference
@@ -4435,7 +4451,8 @@ class TestSDPACudaOnly(NNTestCase):
         g1.replay()
         if fused_kernel != SDPBackend.CUDNN_ATTENTION or dropout_p == 0.0:
             grads_ref_lp = torch.autograd.grad(out_lp_ref, (query, key, value), upstream_grad)
-            grads_ref = torch.autograd.grad(out_ref, (query_ref, key_ref, value_ref), upstream_grad)
+            grads_ref = compute_golden_reference_ieee(
+                torch.autograd.grad, out_ref, (query_ref, key_ref, value_ref), upstream_grad)
 
             fudge_factors = {
                 'out': 3.0,
