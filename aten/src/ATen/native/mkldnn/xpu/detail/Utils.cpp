@@ -137,38 +137,42 @@ dnnl::memory::desc get_onednn_md(const at::Tensor& tensor) {
 
 bool onednn_strides_check(const Tensor& src) {
   auto adims = get_onednn_dims(src);
-  int ndims = (int)adims.size();
-  auto data_type = static_cast<dnnl_data_type_t>(
+  auto data_type = static_cast<dnnl::memory::data_type>(
       get_onednn_dtype_include_double(src, /*allow_undef*/ false));
   auto strides_info = get_onednn_strides(src);
   auto strides = strides_info.empty() ? nullptr : &strides_info[0];
 
-  dnnl_memory_desc_t md;
-  dnnl_status_t status = dnnl_memory_desc_create_with_strides(
-      &md, ndims, adims.data(), data_type, strides);
-  if (status != dnnl_success || md == nullptr) {
+  // Use the C++ RAII wrapper `dnnl::memory::desc`; its destructor will
+  // call `dnnl_memory_desc_destroy` automatically when `md` goes out of
+  // scope, which avoids the use-after-free that previously occurred when
+  // the underlying memory desc was destroyed before all queries against
+  // `md_padded_dims` (a pointer into the desc's internal storage) had
+  // finished. `allow_empty=true` makes construction non-throwing on
+  // unusual stride layouts produced by e.g. einsum -> permute -> reshape.
+  dnnl::memory::desc md(
+      adims, data_type, strides_info, /*allow_empty=*/true);
+  if (md.get(/*allow_empty=*/true) == nullptr) {
     return false;
   }
+  dnnl_memory_desc_t c_md = md.get();
 
   dnnl_format_kind_t md_fmt_kind;
   int md_ndims = 0;
   int md_inner_nblks = 0;
   dnnl_dims_t* md_padded_dims = nullptr;
 
-  dnnl_memory_desc_query(md, dnnl_query_format_kind, &md_fmt_kind);
-  dnnl_memory_desc_query(md, dnnl_query_ndims_s32, &md_ndims);
-  dnnl_memory_desc_query(md, dnnl_query_inner_nblks_s32, &md_inner_nblks);
-  status = dnnl_memory_desc_query(md, dnnl_query_padded_dims, &md_padded_dims);
+  dnnl_memory_desc_query(c_md, dnnl_query_format_kind, &md_fmt_kind);
+  dnnl_memory_desc_query(c_md, dnnl_query_ndims_s32, &md_ndims);
+  dnnl_memory_desc_query(c_md, dnnl_query_inner_nblks_s32, &md_inner_nblks);
+  dnnl_status_t status = dnnl_memory_desc_query(
+      c_md, dnnl_query_padded_dims, &md_padded_dims);
   if (status != dnnl_success || md_padded_dims == nullptr) {
-    dnnl_memory_desc_destroy(md);
     return false;
   }
 
   if (strides == nullptr || md_ndims == 0 ||
-      md_fmt_kind != dnnl_format_kind_t::dnnl_blocked) {
-    dnnl_memory_desc_destroy(md);
+      md_fmt_kind != dnnl_format_kind_t::dnnl_blocked)
     return true;
-  }
 
   // XPU does not support inner-block formats (e.g. nChw16c);
   TORCH_INTERNAL_ASSERT(
@@ -180,16 +184,12 @@ bool onednn_strides_check(const Tensor& src) {
   std::array<int, DNNL_MAX_NDIMS> perm = {0};
   for (int d = 0; d < md_ndims; ++d) {
     // no strides check needed for empty tensor
-    if ((*md_padded_dims)[d] == 0) {
-      dnnl_memory_desc_destroy(md);
+    if ((*md_padded_dims)[d] == 0)
       return true;
-    }
 
     // no strides verification for runtime dims
-    if (strides[d] == DNNL_RUNTIME_DIM_VAL) {
-      dnnl_memory_desc_destroy(md);
+    if (strides[d] == DNNL_RUNTIME_DIM_VAL)
       return true;
-    }
 
     perm[d] = d;
   }
@@ -214,16 +214,13 @@ bool onednn_strides_check(const Tensor& src) {
     // Note: owing to being sorted, these are the initial strides
     if (strides[d] == 0)
       continue;
-    else if (strides[d] < min_stride) {
-      dnnl_memory_desc_destroy(md);
+    else if (strides[d] < min_stride)
       return false;
-    }
 
     // update min_stride for next iteration
     min_stride = strides[d] * (*md_padded_dims)[d];
   }
 
-  dnnl_memory_desc_destroy(md);
   return true;
 }
 
