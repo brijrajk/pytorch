@@ -142,16 +142,11 @@ bool onednn_strides_check(const Tensor& src) {
   auto strides_info = get_onednn_strides(src);
   auto strides = strides_info.empty() ? nullptr : &strides_info[0];
 
-  // Use the C++ RAII wrapper `dnnl::memory::desc`; its destructor will
-  // call `dnnl_memory_desc_destroy` automatically when `md` goes out of
-  // scope, which avoids the use-after-free that previously occurred when
-  // the underlying memory desc was destroyed before all queries against
-  // `md_padded_dims` (a pointer into the desc's internal storage) had
-  // finished. `allow_empty=true` makes construction non-throwing on
-  // unusual stride layouts produced by e.g. einsum -> permute -> reshape.
-  dnnl::memory::desc md(
-      adims, data_type, strides_info, /*allow_empty=*/true);
-  if (md.get(/*allow_empty=*/true) == nullptr) {
+  // Use the C++ RAII wrapper `dnnl::memory::desc` so the underlying
+  // memory descriptor is destroyed automatically when `md` goes out of
+  // scope (after all queries against `md_padded_dims` have finished).
+  dnnl::memory::desc md(adims, data_type, strides_info, /*allow_empty=*/true);
+  if (!md) {
     return false;
   }
   dnnl_memory_desc_t c_md = md.get();
@@ -164,8 +159,8 @@ bool onednn_strides_check(const Tensor& src) {
   dnnl_memory_desc_query(c_md, dnnl_query_format_kind, &md_fmt_kind);
   dnnl_memory_desc_query(c_md, dnnl_query_ndims_s32, &md_ndims);
   dnnl_memory_desc_query(c_md, dnnl_query_inner_nblks_s32, &md_inner_nblks);
-  dnnl_status_t status = dnnl_memory_desc_query(
-      c_md, dnnl_query_padded_dims, &md_padded_dims);
+  dnnl_status_t status =
+      dnnl_memory_desc_query(c_md, dnnl_query_padded_dims, &md_padded_dims);
   if (status != dnnl_success || md_padded_dims == nullptr) {
     return false;
   }
