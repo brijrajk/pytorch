@@ -142,31 +142,18 @@ bool onednn_strides_check(const Tensor& src) {
   auto strides_info = get_onednn_strides(src);
   auto strides = strides_info.empty() ? nullptr : &strides_info[0];
 
-  // Use the C++ RAII wrapper `dnnl::memory::desc` so the underlying
-  // memory descriptor is destroyed automatically when `md` goes out of
-  // scope (after all queries against `md_padded_dims` have finished).
   dnnl::memory::desc md(adims, data_type, strides_info, /*allow_empty=*/true);
   if (!md) {
     return false;
   }
-  dnnl_memory_desc_t c_md = md.get();
 
-  dnnl_format_kind_t md_fmt_kind;
-  int md_ndims = 0;
-  int md_inner_nblks = 0;
-  dnnl_dims_t* md_padded_dims = nullptr;
-
-  dnnl_memory_desc_query(c_md, dnnl_query_format_kind, &md_fmt_kind);
-  dnnl_memory_desc_query(c_md, dnnl_query_ndims_s32, &md_ndims);
-  dnnl_memory_desc_query(c_md, dnnl_query_inner_nblks_s32, &md_inner_nblks);
-  dnnl_status_t status =
-      dnnl_memory_desc_query(c_md, dnnl_query_padded_dims, &md_padded_dims);
-  if (status != dnnl_success || md_padded_dims == nullptr) {
-    return false;
-  }
+  int md_ndims = md.get_ndims();
+  auto md_fmt_kind = md.get_format_kind();
+  int md_inner_nblks = md.get_inner_nblks();
+  auto padded_dims = md.get_padded_dims();
 
   if (strides == nullptr || md_ndims == 0 ||
-      md_fmt_kind != dnnl_format_kind_t::dnnl_blocked)
+      md_fmt_kind != dnnl::memory::format_kind::blocked)
     return true;
 
   // XPU does not support inner-block formats (e.g. nChw16c);
@@ -179,7 +166,7 @@ bool onednn_strides_check(const Tensor& src) {
   std::array<int, DNNL_MAX_NDIMS> perm = {0};
   for (int d = 0; d < md_ndims; ++d) {
     // no strides check needed for empty tensor
-    if ((*md_padded_dims)[d] == 0)
+    if (padded_dims[d] == 0)
       return true;
 
     // no strides verification for runtime dims
@@ -191,11 +178,10 @@ bool onednn_strides_check(const Tensor& src) {
 
   // A custom comparator to yield linear order on perm
   auto idx_sorter = [&](const int a, const int b) -> bool {
-    if (strides[a] == strides[b] &&
-        (*md_padded_dims)[a] == (*md_padded_dims)[b])
+    if (strides[a] == strides[b] && padded_dims[a] == padded_dims[b])
       return a < b;
     else if (strides[a] == strides[b])
-      return (*md_padded_dims)[a] < (*md_padded_dims)[b];
+      return padded_dims[a] < padded_dims[b];
     else
       return strides[a] < strides[b];
   };
@@ -213,7 +199,7 @@ bool onednn_strides_check(const Tensor& src) {
       return false;
 
     // update min_stride for next iteration
-    min_stride = strides[d] * (*md_padded_dims)[d];
+    min_stride = strides[d] * padded_dims[d];
   }
 
   return true;
