@@ -451,7 +451,77 @@ def _recompiles_for_inputs(fn, inputs1, inputs2, dynamic=True):
     return compile_count[0] > 1
 
 
-class SubclassTests(torch._dynamo.test_case.TestCase):
+
+class _SubclassCompileCheckMixin:
+    """Shared helpers for subclass compile-check tests."""
+
+    # copied from common_utils.py::NestedTensorTestCase
+    def assertEqualIgnoringNestedInts(self, a, b):
+        # unbinding NJTs allows us to compare them as essentially equal without
+        # caring about exact nested int comparison
+        def _unbind_njts(x):
+            if isinstance(x, torch.Tensor) and x.is_nested and x.layout == torch.jagged:
+                return x.unbind()
+            else:
+                return x
+
+        self.assertEqual(
+            pytree.tree_map(_unbind_njts, a), pytree.tree_map(_unbind_njts, b)
+        )
+
+    def _compile_check(
+        self,
+        fn,
+        inps,
+        *,
+        dynamic=True,
+        fullgraph=True,
+        call_backward=False,
+    ):
+        def call_backward_fn(t):
+            if t.is_nested:
+                from torch.nested._internal.nested_tensor import buffer_from_jagged
+
+                t = buffer_from_jagged(t)
+            return t.sum().backward(retain_graph=True)
+
+        torch.manual_seed(0)
+        fw_compiler = EagerRecordGraphAndInputs()
+        bw_compiler = EagerRecordGraphAndInputs()
+        compiler_fn = aot_autograd(
+            fw_compiler=make_boxed_compiler(fw_compiler),
+            bw_compiler=make_boxed_compiler(bw_compiler),
+            partition_fn=min_cut_rematerialization_partition,
+            keep_inference_input_mutations=True,
+        )
+
+        c = torch.compile(backend=compiler_fn, dynamic=dynamic, fullgraph=fullgraph)(fn)
+        for inp in inps:
+            expected = fn(*inp)
+            # reset the seed for randn to generate the same tensor
+            torch.manual_seed(0)
+            got = c(*inp)
+            self.assertEqualIgnoringNestedInts(expected, got)
+
+            if call_backward:
+                re = pytree.tree_map_only(
+                    lambda x: isinstance(x, torch.Tensor) and x.requires_grad,
+                    call_backward_fn,
+                    expected,
+                )
+                rg = pytree.tree_map_only(
+                    lambda x: isinstance(x, torch.Tensor) and x.requires_grad,
+                    call_backward_fn,
+                    got,
+                )
+                self.assertEqualIgnoringNestedInts(re, rg)
+
+        if call_backward:
+            return fw_compiler.graphs, bw_compiler.graphs
+        return fw_compiler.graphs, None
+
+
+class SubclassTests(_SubclassCompileCheckMixin, torch._dynamo.test_case.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls._exit_stack.close()
@@ -2523,70 +2593,54 @@ class GraphModule(torch.nn.Module):
 
         mod(torch.randn(4))
 
-    # copied from common_utils.py::NestedTensorTestCase
-    def assertEqualIgnoringNestedInts(self, a, b):
-        # unbinding NJTs allows us to compare them as essentially equal without
-        # caring about exact nested int comparison
-        def _unbind_njts(x):
-            if isinstance(x, torch.Tensor) and x.is_nested and x.layout == torch.jagged:
-                return x.unbind()
-            else:
-                return x
+    def test_deferred_init_subclass_init_not_traced(self):
+        """
+        Tracing a function that constructs a DeferredInitSubclass must not crash.
 
-        self.assertEqual(
-            pytree.tree_map(_unbind_njts, a), pytree.tree_map(_unbind_njts, b)
+        The bug: when Dynamo's frame hook intercepts __init__ as a root frame,
+        self is partially initialised (attributes not yet set by __init__).
+        Previously, wrap_tensor would call __tensor_flatten__ on this
+        partially-initialised self and raise AttributeError.
+
+        The fix skips tracing __init__ of traceable wrapper subclasses at the
+        frame level (convert_frame.py), so __init__ runs eagerly like
+        @torch._disable_dynamo would.
+        """
+        # Compile __init__ directly, simulating the root-frame interception
+        # scenario that occurs in practice (e.g. Diffusers + TorchAO + Dynamo).
+        compiled_init = torch.compile(
+            DeferredInitSubclass.__init__, backend="eager", fullgraph=False
         )
+        data = torch.randn(4, 4)
+        shell = DeferredInitSubclass.__new__(DeferredInitSubclass, data, 2.0)
 
-    def _compile_check(
-        self,
-        fn,
-        inps,
-        *,
-        dynamic=True,
-        fullgraph=True,
-        call_backward=False,
-    ):
-        def call_backward_fn(t):
-            if t.is_nested:
-                from torch.nested._internal.nested_tensor import buffer_from_jagged
+        # Should not raise AttributeError from __tensor_flatten__ on partial self
+        compiled_init(shell, data, 2.0)
 
-                t = buffer_from_jagged(t)
-            return t.sum().backward(retain_graph=True)
+        self.assertEqual(shell._data, data)
+        self.assertEqual(shell._scale, 2.0)
 
-        torch.manual_seed(0)
-        fw_compiler = EagerRecordGraphAndInputs()
-        bw_compiler = EagerRecordGraphAndInputs()
-        compiler_fn = aot_autograd(
-            fw_compiler=make_boxed_compiler(fw_compiler),
-            bw_compiler=make_boxed_compiler(bw_compiler),
-            partition_fn=min_cut_rematerialization_partition,
-            keep_inference_input_mutations=True,
-        )
+    def test_tensor_subclass_super_new(self):
+        # super().__new__(cls, tensor) should be traceable in Tensor subclasses
+        class MyTensor(torch.Tensor):
+            def __new__(cls, x):
+                return super().__new__(cls, x)
 
-        c = torch.compile(backend=compiler_fn, dynamic=dynamic, fullgraph=fullgraph)(fn)
-        for inp in inps:
-            expected = fn(*inp)
-            # reset the seed for randn to generate the same tensor
-            torch.manual_seed(0)
-            got = c(*inp)
-            self.assertEqualIgnoringNestedInts(expected, got)
+        @torch.compile(backend="eager", fullgraph=True)
+        def forward(x):
+            return MyTensor(x)
 
-            if call_backward:
-                re = pytree.tree_map_only(
-                    lambda x: isinstance(x, torch.Tensor) and x.requires_grad,
-                    call_backward_fn,
-                    expected,
-                )
-                rg = pytree.tree_map_only(
-                    lambda x: isinstance(x, torch.Tensor) and x.requires_grad,
-                    call_backward_fn,
-                    got,
-                )
-                self.assertEqualIgnoringNestedInts(re, rg)
+        x = torch.randn(4, 10)
+        result = forward(x)
+        self.assertIsInstance(result, MyTensor)
+        self.assertEqual(result, x)
 
-        if call_backward:
-            return fw_compiler.graphs, bw_compiler.graphs
-        return fw_compiler.graphs, None
+
+instantiate_parametrized_tests(SubclassTests)
+
+
+class TestTwoTensorSubclass(_SubclassCompileCheckMixin, torch._dynamo.test_case.TestCase):
+    """Tests for TwoTensor wrapper subclass tracing under dynamo."""
 
     def test_tensor_subclass_TwoTensor_simple(self):
         def f(tt):
@@ -3383,6 +3437,10 @@ class GraphModule(torch.nn.Module):
         out = f(x, y)
         self.assertEqual(out, (x.sin().sum(), y.sin().sum()))
 
+
+class TestNJTSubclass(_SubclassCompileCheckMixin, torch._dynamo.test_case.TestCase):
+    """Tests for nested jagged tensor (NJT) subclass tracing under dynamo."""
+
     def test_njt_subclass_simple(self):
         def f(nt):
             y = nt.clone()
@@ -3603,51 +3661,6 @@ class <lambda>(torch.nn.Module):
         )
 """,
         )
-
-    def test_deferred_init_subclass_init_not_traced(self):
-        """
-        Tracing a function that constructs a DeferredInitSubclass must not crash.
-
-        The bug: when Dynamo's frame hook intercepts __init__ as a root frame,
-        self is partially initialised (attributes not yet set by __init__).
-        Previously, wrap_tensor would call __tensor_flatten__ on this
-        partially-initialised self and raise AttributeError.
-
-        The fix skips tracing __init__ of traceable wrapper subclasses at the
-        frame level (convert_frame.py), so __init__ runs eagerly like
-        @torch._disable_dynamo would.
-        """
-        # Compile __init__ directly, simulating the root-frame interception
-        # scenario that occurs in practice (e.g. Diffusers + TorchAO + Dynamo).
-        compiled_init = torch.compile(
-            DeferredInitSubclass.__init__, backend="eager", fullgraph=False
-        )
-        data = torch.randn(4, 4)
-        shell = DeferredInitSubclass.__new__(DeferredInitSubclass, data, 2.0)
-
-        # Should not raise AttributeError from __tensor_flatten__ on partial self
-        compiled_init(shell, data, 2.0)
-
-        self.assertEqual(shell._data, data)
-        self.assertEqual(shell._scale, 2.0)
-
-    def test_tensor_subclass_super_new(self):
-        # super().__new__(cls, tensor) should be traceable in Tensor subclasses
-        class MyTensor(torch.Tensor):
-            def __new__(cls, x):
-                return super().__new__(cls, x)
-
-        @torch.compile(backend="eager", fullgraph=True)
-        def forward(x):
-            return MyTensor(x)
-
-        x = torch.randn(4, 10)
-        result = forward(x)
-        self.assertIsInstance(result, MyTensor)
-        self.assertEqual(result, x)
-
-
-instantiate_parametrized_tests(SubclassTests)
 
 
 # Tests for the issubclass() builtin
