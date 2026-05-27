@@ -848,31 +848,15 @@ class TestFlopCounter(TestCase):
         expected = sdpa_flop_count((B, H, S, D), (B, H, S, D), (B, H, S, D))
         self.assertEqual(flash_flops, expected)
 
-    @unittest.skipIf(not HAS_CUDA, "CUDA not available")
-    @unittest.skipIf(
-        not PLATFORM_SUPPORTS_FLASH_ATTENTION,
-        "Does not support flash attention",
-    )
     def test_flash_attention_backward_flop_layout(self):
         B, S, H, D = 2, 128, 8, 64
-        q = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16)
-        k = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16)
-        v = torch.randn(B, S, H, D, device="cuda", dtype=torch.float16)
-
-        out, logsumexp, _, _, _ = torch.ops.aten._flash_attention_forward(
-            q,
-            k,
-            v,
-            None,
-            None,
-            S,
-            S,
-            0.0,
-            False,
-            False,
-        )
-        grad_out = torch.randn_like(out)
-        rng_state = torch.zeros(2, dtype=torch.int64, device="cuda")
+        q = torch.randn(B, S, H, D, device="meta", dtype=torch.float16)
+        k = torch.randn(B, S, H, D, device="meta", dtype=torch.float16)
+        v = torch.randn(B, S, H, D, device="meta", dtype=torch.float16)
+        out = torch.randn(B, S, H, D, device="meta", dtype=torch.float16)
+        grad_out = torch.randn(B, S, H, D, device="meta", dtype=torch.float16)
+        logsumexp = torch.randn(B, H, S, device="meta", dtype=torch.float32)
+        rng_state = torch.zeros(2, dtype=torch.int64, device="meta")
 
         with FlopCounterMode() as mode:
             torch.ops.aten._flash_attention_backward(
