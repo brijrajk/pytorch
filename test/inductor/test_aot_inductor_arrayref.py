@@ -102,6 +102,30 @@ class AOTInductorArrayRefTestsTemplate(AOTInductorTestsTemplate):
             "borrow_arrayref_tensor_as_tensor("
         ).run(code)
 
+    def test_thread_local_cached_output_uses_brace_init(self):
+        class Model(torch.nn.Module):
+            def forward(self, x, y):
+                return x + y, x.view(-1)
+
+        example_inputs = (
+            torch.randn(4, 4, device=self.device),
+            torch.randn(4, 4, device=self.device),
+        )
+        model = Model()
+        with config.patch(
+            {
+                "aot_inductor.allow_stack_allocation": self.allow_stack_allocation,
+                "aot_inductor.use_minimal_arrayref_interface": self.use_minimal_arrayref_interface,
+            }
+        ):
+            _, code = run_and_get_cpp_code(
+                AOTIRunnerUtil.compile, model, example_inputs
+            )
+
+        FileCheck().check("ThreadLocalCachedOutput").check_regex(
+            r"cached_output_\d+\{"
+        ).run(code)
+
     def test_simple_v2_interface(self):
         class Model(torch.nn.Module):
             def __init__(self) -> None:
