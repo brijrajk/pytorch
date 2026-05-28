@@ -31,7 +31,7 @@ from torch.testing._internal.common_mps import mps_ops_modifier, mps_ops_grad_mo
 from torch.testing import make_tensor
 from torch.testing._internal.common_dtype import get_all_dtypes, integral_types
 import torch.backends.mps
-from torch.distributions import Uniform, Exponential
+from torch.distributions import Uniform, Exponential, Dirichlet
 from torch.utils._python_dispatch import TorchDispatchMode
 from functools import partial
 
@@ -1625,6 +1625,31 @@ class TestMPS(TestCaseMPS):
         self.assertEqual(high.grad, rand)
         low.grad.zero_()
         high.grad.zero_()
+
+    @parametrize("num_alpha", [10, 1000, 10_000])
+    def test_dirichlet(self, num_alpha):
+        import time
+        torch.manual_seed(time.time())
+        alpha = torch.rand(num_alpha, device='mps')
+        dist = Dirichlet(alpha)
+        batch_shape = (30000 // num_alpha, 400)
+        x = dist.sample(batch_shape)
+
+        self.assertTrue((x >= 0).all())
+        sums = x.sum(dim=-1)
+        self.assertEqual(sums, torch.ones_like(sums))
+
+        means = x.mean(dim=-1)
+        self.assertEqual(means, torch.empty_like(means).fill_(1 / num_alpha))
+
+        batch_dims = list(range(len(batch_shape)))
+        self.assertEqual(x.mean(dim=batch_dims), alpha / alpha.sum(), atol=1e-3, rtol=1e-3)
+
+        # Compare mean and var with CPU impl
+        dist_cpu = Dirichlet(alpha.cpu())
+        x_cpu = dist_cpu.sample(batch_shape)
+        self.assertEqual(x.mean(dim=batch_dims).cpu(), x_cpu.mean(dim=batch_dims), atol=1e-3, rtol=1e-3)
+        self.assertEqual(x.var(dim=batch_dims).cpu(), x_cpu.var(dim=batch_dims), atol=1e-3, rtol=1e-3)
 
     def test_randperm(self, device="mps"):
         rng_device = None
